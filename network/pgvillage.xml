@@ -1,0 +1,21 @@
+<!--
+  The pgvillage network, in qemu:///system (only root can change it).
+  The VMs of the user Claude runs as (qemu:///session) attach to its bridge through qemu-bridge-helper,
+  which /etc/qemu/bridge.conf allows for this bridge only.
+
+  - NAT to the internet through the host; not bridged to the LAN.
+  - DHCP from .100 to .199. .2 to .99 are free for static addresses and VIPs.
+  - DNS: a VM that sends its hostname with DHCP (cloud-init does) gets <hostname>.pgv.internal.
+-->
+<network>
+  <name>pgvillage</name>
+  <forward mode='nat'/>
+  <!-- A bridge name has at most 15 characters -->
+  <bridge name='virbr-pgv' stp='on' delay='0'/>
+  <domain name='pgv.internal' localOnly='yes'/>
+  <ip address='192.168.130.1' netmask='255.255.255.0'>
+    <dhcp>
+      <range start='192.168.130.100' end='192.168.130.199'/>
+    </dhcp>
+  </ip>
+</network>
