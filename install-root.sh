@@ -88,6 +88,10 @@ if [ "$(stat -c '%U %G %a' "${HELPER}")" != "root ${BRIDGE_GROUP} 4750" ]; then
   exit 1
 fi
 
+echo "5. vm-ssh in /usr/local/bin, root-owned: Claude runs it outside its sandbox, so Claude must not be able to change it"
+command -v dig >/dev/null || { echo "ERROR: dig is missing (apt install bind9-dnsutils)" >&2; exit 1; }
+install -o root -g root -m 0755 "${DIR}/bin/vm-ssh" /usr/local/bin/vm-ssh
+
 echo
 echo "Done. The group changes apply to new logins of ${CLAUDE_USER}: restart its user manager"
 echo "(sudo systemctl restart user@$(id -u "${CLAUDE_USER}").service) when no Claude session runs, or reboot."
