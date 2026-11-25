@@ -32,6 +32,10 @@ The dedicated Linux account is the primary security boundary. The session libvir
 
 This is accepted by design. The objective is to prevent host privilege escalation, not to restrict Claude to a particular directory or set of VM management commands.
 
+Claude's `virsh` and `virt-install` commands run outside the sandbox (see step 3). That includes everything on such a
+command line, such as a redirect (`virsh dumpxml x > file`), which can then write any file `ted` can. Check such
+command lines before approving them.
+
 ## Setup
 
 ### 1. As root: `install-root.sh`
@@ -65,14 +69,12 @@ sudo -u ted XDG_RUNTIME_DIR=/run/user/$(id -u ted) ./install-user.sh
 
 ### 3. Claude Code settings
 
-In `~/.claude/settings.json` (Claude can't change this file):
+In `~/.claude/settings.json` (Claude's sandbox can't write this file; Robert edits it or approves Claude's edit):
 
 ```json
 {
   "sandbox": {
-    "network": {
-      "allowUnixSockets": ["/run/user/1001/libvirt/libvirt-sock"]
-    }
+    "excludedCommands": ["virsh *", "virt-install *"]
   },
   "env": {
     "LIBVIRT_DEFAULT_URI": "qemu:///session",
@@ -81,7 +83,12 @@ In `~/.claude/settings.json` (Claude can't change this file):
 }
 ```
 
-- `allowUnixSockets`: only the socket of `ted`'s session libvirtd (1001 is `ted`'s uid).
+- `excludedCommands`: `virsh` and `virt-install` run outside the sandbox, so they can reach the session socket.
+  This only matches a command line that starts with them: not a pipe (`virsh list | grep x`), not a script that
+  calls `virsh`.
+- Why not `allowUnixSockets`: on Linux the sandbox blocks creating *any* unix socket (seccomp, at `socket()`, before
+  a path is known), so a per-path allow has no effect. `allowAllUnixSockets` would open every socket `ted` has,
+  including the systemd user manager.
 - `LIBVIRT_DEFAULT_URI`: `virsh` and `virt-install` use the session without `-c`.
 - `LIBVIRT_AUTOSTART=0`: when the user service isn't running, `virsh` fails instead of starting a libvirtd inside the
   sandbox.
@@ -95,8 +102,21 @@ session libvirtd.
 ./check.sh
 ```
 
-Run it as `ted` outside the sandbox after step 2, and let Claude run it after step 3. It checks the limits (not in the
-`libvirt` group, no access to `qemu:///system`) and the setup, and starts and removes a test VM on `virbr-pgv`.
+Run it as `ted` outside the sandbox after step 2. It checks the limits (not in the `libvirt` group, no access to
+`qemu:///system`) and the setup, and starts and removes a test VM on `virbr-pgv`.
+
+From Claude (after step 3), `check.sh` passes the limits and setup checks but fails the libvirt ones: the `virsh`
+calls inside the script run in the sandbox. Claude runs those one by one instead:
+
+```bash
+virsh uri
+virsh domcapabilities --virttype kvm
+virsh pool-info vms
+virt-install --name claude-check --memory 256 --vcpus 1 --virt-type kvm --pxe --disk none \
+  --network bridge=virbr-pgv --graphics none --noautoconsole --osinfo detect=on,require=off
+virsh destroy claude-check
+virsh undefine claude-check
+```
 
 ## Not (yet) covered
 
