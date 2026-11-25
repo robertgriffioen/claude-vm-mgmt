@@ -1,7 +1,7 @@
 #!/bin/bash
-# Checks that the setup works and that its limits hold. Run as the user Claude runs as: outside the sandbox (after
-# install-user.sh), and from Claude (inside the sandbox, after the settings change). Changes nothing, except a
-# short-lived test VM (claude-check) that it removes again.
+# Checks that the setup works and that its limits hold. Run as the user Claude runs as, outside the sandbox (after
+# install-user.sh). From Claude, the libvirt checks fail because the virsh calls in this script run inside the
+# sandbox; see README, step 4. Changes nothing, except a short-lived test VM (claude-check) that it removes again.
 set -uo pipefail
 
 BRIDGE=virbr-pgv
