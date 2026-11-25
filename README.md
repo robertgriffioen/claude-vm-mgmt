@@ -1,13 +1,13 @@
 # claude-vm-mgmt
 
-Lets Claude Code create, run and remove KVM virtual machines on this Linux machine, without root and without access to
-the rest of the system.
+Lets Claude Code create, run and remove KVM virtual machines using an unprivileged, dedicated Linux account, without granting root-equivalent access to the physical host or system libvirt management.
 
 ## The idea
 
 Claude Code runs as its own user (here: `ted`) in a sandbox. It gets VMs through **libvirt in session mode**
-(`qemu:///session`): a libvirtd that runs as that user, with VMs that run as that user. A VM can never reach more than
-the user can, whatever its configuration says.
+(`qemu:///session`): a libvirtd that runs as that user, with VMs that run as that user.
+
+The session libvirt daemon and its QEMU processes run with the privileges of the dedicated Linux user. Arbitrary VM configurations do not inherently grant additional host privileges. The QEMU bridge helper is an explicitly delegated privileged operation.
 
 The alternative, the system libvirt (`qemu:///system`, via the `libvirt` group), is effectively root: a VM's XML can
 pass any host disk or device to the VM. Polkit rules can limit which VMs and networks a user may manage, but not what
@@ -25,6 +25,13 @@ Why the session libvirtd runs as a user service, and not started by `virsh` (the
 sandbox hides `/dev/kvm` and has its own network, so a libvirtd started from the sandbox couldn't run VMs. The user
 service runs outside the sandbox; Claude only gets its socket.
 
+
+## Security boundary
+
+The dedicated Linux account is the primary security boundary. The session libvirt daemon runs outside Claude's sandbox, so access to its socket may allow Claude to indirectly access files, devices and network resources available to the dedicated account but restricted by the sandbox.
+
+This is accepted by design. The objective is to prevent host privilege escalation, not to restrict Claude to a particular directory or set of VM management commands.
+
 ## Setup
 
 ### 1. As root: `install-root.sh`
@@ -35,15 +42,15 @@ sudo ./install-root.sh
 
 | Step | What | Why |
 |------|------|-----|
-| 1 | `ted` into the `kvm` group, out of the `libvirt` group | `/dev/kvm` for the VMs; the `libvirt` group gives full access to `qemu:///system` |
+| 1 | `ted` into the `kvm` and `vm-bridge` groups | `/dev/kvm` for the VMs; `vm-bridge` may run the bridge helper (step 4) |
 | 2 | `loginctl enable-linger ted` | `ted`'s user services (libvirtd, and so the VMs) keep running without a login |
 | 3 | Network `pgvillage` from `network/pgvillage.xml`, started and autostarted | The VMs' network: `192.168.130.0/24`, NAT, DHCP `.100`-`.199`, DNS `<hostname>.pgv.internal`. `.2`-`.99` are free for static addresses and VIPs. Not bridged to the LAN. |
-| 4 | `allow virbr-pgv` in `/etc/qemu/bridge.conf`, `qemu-bridge-helper` setuid root (with `dpkg-statoverride`, so updates keep it) | Session VMs can't create network devices themselves; the helper does it for them, only for allowed bridges |
+| 4 | `allow virbr-pgv` in `/etc/qemu/bridge.conf`, `qemu-bridge-helper` setuid root and only executable for `vm-bridge` (`root:vm-bridge 4750`, with `dpkg-statoverride`, so updates keep it) | Session VMs can't create network devices themselves; the helper does it for them, only for allowed bridges |
 
 The group changes apply to new logins: restart `ted`'s user manager when no Claude session runs
 (`sudo systemctl restart user@$(id -u ted).service`), or reboot.
 
-Note: step 4 allows *every* user on this machine to attach VMs to `virbr-pgv`. That is the only thing it allows.
+Note: step 4 allows the members of `vm-bridge` to attach VMs to `virbr-pgv`. That is the only thing it allows.
 
 ### 2. As `ted`, outside the sandbox: `install-user.sh`
 
@@ -106,10 +113,11 @@ systemctl --user disable --now libvirtd-session.service
 rm ~/.config/systemd/user/libvirtd-session.service
 # as root
 sed -i '/^allow virbr-pgv$/d' /etc/qemu/bridge.conf
-dpkg-statoverride --remove /usr/lib/qemu/qemu-bridge-helper && chmod u-s /usr/lib/qemu/qemu-bridge-helper
+dpkg-statoverride --remove /usr/lib/qemu/qemu-bridge-helper
+chown root:root /usr/lib/qemu/qemu-bridge-helper && chmod 0755 /usr/lib/qemu/qemu-bridge-helper
+gpasswd -d ted vm-bridge && groupdel vm-bridge
 virsh -c qemu:///system net-destroy pgvillage; virsh -c qemu:///system net-undefine pgvillage
 loginctl disable-linger ted
-gpasswd -d ted kvm
 ```
 
 Remove the settings of step 3. The VMs and disks in `~/vms` are `ted`'s; remove them with `virsh` before the user

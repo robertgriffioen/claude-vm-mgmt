@@ -10,17 +10,42 @@ set -euo pipefail
 CLAUDE_USER=${CLAUDE_USER:-ted}
 NETWORK=pgvillage
 BRIDGE=virbr-pgv
+BRIDGE_GROUP=vm-bridge
 HELPER=/usr/lib/qemu/qemu-bridge-helper
 DIR=$(cd "$(dirname "$0")" && pwd)
 
 [ "$(id -u)" = 0 ] || { echo "Run this with sudo" >&2; exit 1; }
 id "${CLAUDE_USER}" >/dev/null
 
-echo "1. Groups of ${CLAUDE_USER}: kvm (to run VMs), not libvirt (full access to qemu:///system)"
-usermod -aG kvm "${CLAUDE_USER}"
-if id -nG "${CLAUDE_USER}" | tr ' ' '\n' | grep -qx libvirt; then
-  gpasswd -d "${CLAUDE_USER}" libvirt
+
+echo "0. Verify security prerequisites for ${CLAUDE_USER}"
+
+GROUPS_LIST=$(id -nG "${CLAUDE_USER}" | tr ' ' '\n')
+
+for group in sudo libvirt docker lxd disk; do
+  if grep -qx "${group}" <<< "${GROUPS_LIST}"; then
+    echo "ERROR: ${CLAUDE_USER} belongs to privileged group ${group}" >&2
+    exit 1
+  fi
+done
+
+SUDO_PERMISSIONS=$(LC_ALL=C sudo -l -U "${CLAUDE_USER}" 2>&1 || true)
+
+if ! grep -Fq "User ${CLAUDE_USER} is not allowed to run sudo" <<< "${SUDO_PERMISSIONS}"; then
+  echo "ERROR: Cannot confirm that ${CLAUDE_USER} has no sudo privileges" >&2
+  echo "${SUDO_PERMISSIONS}" >&2
+  exit 1
 fi
+
+echo "1. Groups of ${CLAUDE_USER}: kvm (to run VMs) and ${BRIDGE_GROUP} (to run the QEMU bridge helper)."
+# Not libvirt (full access to qemu:///system): step 0 stops when ${CLAUDE_USER} is in it.
+usermod -aG kvm "${CLAUDE_USER}"
+
+if ! getent group "${BRIDGE_GROUP}" >/dev/null; then
+  groupadd --system "${BRIDGE_GROUP}"
+fi
+usermod -aG "${BRIDGE_GROUP}" "${CLAUDE_USER}"
+
 
 echo "2. Lingering for ${CLAUDE_USER}: its user services (libvirtd, the VMs) keep running without a login"
 loginctl enable-linger "${CLAUDE_USER}"
@@ -34,15 +59,33 @@ if ! virsh -c qemu:///system net-info "${NETWORK}" | grep -Eq '^Active:\s+yes'; 
   virsh -c qemu:///system net-start "${NETWORK}"
 fi
 
-echo "4. qemu-bridge-helper may attach VMs of any user to ${BRIDGE}, and only to that bridge"
+echo "4. qemu-bridge-helper may attach VMs of ${BRIDGE_GROUP} members to ${BRIDGE}, and only to that bridge"
+
 mkdir -p /etc/qemu
-touch /etc/qemu/bridge.conf
-grep -qx "allow ${BRIDGE}" /etc/qemu/bridge.conf || echo "allow ${BRIDGE}" >>/etc/qemu/bridge.conf
+
+# Create the bridge configuration or validate the existing one.
+if [ ! -e /etc/qemu/bridge.conf ]; then
+  echo "allow ${BRIDGE}" >/etc/qemu/bridge.conf
+elif [ "$(cat /etc/qemu/bridge.conf)" != "allow ${BRIDGE}" ]; then
+  echo "ERROR: Unexpected configuration in /etc/qemu/bridge.conf" >&2
+  exit 1
+fi
+
 chown root:root /etc/qemu/bridge.conf
 chmod 0644 /etc/qemu/bridge.conf
-# setuid root, registered with dpkg so a qemu update keeps it
+
+# Setuid root, registered with dpkg so a qemu update keeps it.
 if ! dpkg-statoverride --list "${HELPER}" >/dev/null; then
-  dpkg-statoverride --update --add root root 4755 "${HELPER}"
+  dpkg-statoverride --update --add root "${BRIDGE_GROUP}" 4750 "${HELPER}"
+elif [ "$(dpkg-statoverride --list "${HELPER}")" != "root ${BRIDGE_GROUP} 4750 ${HELPER}" ]; then
+  echo "ERROR: Unexpected dpkg-statoverride for ${HELPER}" >&2
+  exit 1
+fi
+
+# Verify the actual ownership and permissions.
+if [ "$(stat -c '%U %G %a' "${HELPER}")" != "root ${BRIDGE_GROUP} 4750" ]; then
+  echo "ERROR: Unexpected ownership or permissions on ${HELPER}" >&2
+  exit 1
 fi
 
 echo

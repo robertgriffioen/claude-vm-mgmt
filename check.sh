@@ -7,7 +7,7 @@ set -uo pipefail
 BRIDGE=virbr-pgv
 POOL=vms
 URI=qemu:///session
-TEST_VM=claude-check
+TEST_VM="claude-check-$(cat /proc/sys/kernel/random/uuid)"
 FAILED=0
 
 ok() { echo "OK    $1"; }
@@ -35,6 +35,7 @@ check_not "not root" test "$(id -u)" = 0
 echo "== Setup"
 check "/etc/qemu/bridge.conf allows ${BRIDGE}" grep -qx "allow ${BRIDGE}" /etc/qemu/bridge.conf
 check "qemu-bridge-helper is setuid" test -u /usr/lib/qemu/qemu-bridge-helper
+check "in the vm-bridge group (may run the bridge helper)" bash -c "getent group vm-bridge | cut -d: -f4 | tr ',' '\n' | grep -qx \"$(id -un)\""
 check "${URI} answers" virsh -c ${URI} uri
 check "KVM is available to ${URI}" virsh -c ${URI} domcapabilities --virttype kvm
 check "storage pool ${POOL} is running" bash -c "virsh -c ${URI} pool-info ${POOL} | grep -Eq '^State:\s+running'"
