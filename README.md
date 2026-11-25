@@ -19,7 +19,8 @@ a VM's XML contains, so they don't close that.
 | `qemu-bridge-helper` (setuid root) | root | Only one thing: attach a VM's network card to a bridge in `/etc/qemu/bridge.conf` |
 | libvirtd (session), as a user service | `ted` | Manage `ted`'s VMs, networks of its own (none needed), storage pool `vms` |
 | The VMs (qemu) | `ted` | What `ted` can: its own files, `/dev/kvm` |
-| Claude Code (sandboxed) | `ted` | Talk to the session libvirtd over its socket |
+| Claude Code (sandboxed) | `ted` | Talk to the session libvirtd over its socket (`virsh`, `virt-install`); ssh to the VMs (`vm-ssh`) |
+| `vm-ssh` (`/usr/local/bin`, root-owned) | `ted` | Only ssh to `192.168.130.2`-`254`, with fixed options and its own key |
 
 Why the session libvirtd runs as a user service, and not started by `virsh` (the default for session mode): Claude's
 sandbox hides `/dev/kvm` and has its own network, so a libvirtd started from the sandbox couldn't run VMs. The user
@@ -32,9 +33,9 @@ The dedicated Linux account is the primary security boundary. The session libvir
 
 This is accepted by design. The objective is to prevent host privilege escalation, not to restrict Claude to a particular directory or set of VM management commands.
 
-Claude's `virsh` and `virt-install` commands run outside the sandbox (see step 3). That includes everything on such a
-command line, such as a redirect (`virsh dumpxml x > file`), which can then write any file `ted` can. Check such
-command lines before approving them.
+Claude's `virsh`, `virt-install` and `vm-ssh` commands run outside the sandbox (see step 3). A command line with a
+pipe or redirect (`virsh list | grep x`, `virsh dumpxml x > file`) didn't match the exclusion and ran inside the
+sandbox (seen 2026-11-25). Still, check unusual command lines before approving them.
 
 ## Setup
 
@@ -50,6 +51,7 @@ sudo ./install-root.sh
 | 2 | `loginctl enable-linger ted` | `ted`'s user services (libvirtd, and so the VMs) keep running without a login |
 | 3 | Network `pgvillage` from `network/pgvillage.xml`, started and autostarted | The VMs' network: `192.168.130.0/24`, NAT, DHCP `.100`-`.199`, DNS `<hostname>.pgv.internal`. `.2`-`.99` are free for static addresses and VIPs. Not bridged to the LAN. |
 | 4 | `allow virbr-pgv` in `/etc/qemu/bridge.conf`, `qemu-bridge-helper` setuid root and only executable for `vm-bridge` (`root:vm-bridge 4750`, with `dpkg-statoverride`, so updates keep it) | Session VMs can't create network devices themselves; the helper does it for them, only for allowed bridges |
+| 5 | `bin/vm-ssh` installed as `/usr/local/bin/vm-ssh`, `root:root 755` | Claude runs it outside the sandbox, so Claude must not be able to change it (see "ssh to the VMs"). Needs `dig`. |
 
 The group changes apply to new logins: restart `ted`'s user manager when no Claude session runs
 (`sudo systemctl restart user@$(id -u ted).service`), or reboot.
@@ -65,7 +67,8 @@ sudo -u ted XDG_RUNTIME_DIR=/run/user/$(id -u ted) ./install-user.sh
 | Step | What | Why |
 |------|------|-----|
 | 1 | User service `libvirtd-session.service` (`~/.config/systemd/user/`) | The session libvirtd, outside the sandbox. `KillMode=process`: restarting libvirtd doesn't stop the VMs. |
-| 2 | Storage pool `vms` in `~/vms` | Where the VM disks and images live, owned by `ted` |
+| 2 | Storage pools `vms` in `~/vms` and `images` in `~/images` | VM disks and downloaded cloud images, owned by `ted` |
+| 3 | ssh key `~/.ssh/pgv_ed25519` | Used only by `vm-ssh`; the `.pub` goes into VMs with `virt-install --cloud-init ssh-key=...` |
 
 ### 3. Claude Code settings
 
@@ -74,7 +77,7 @@ In `~/.claude/settings.json` (Claude's sandbox can't write this file; Robert edi
 ```json
 {
   "sandbox": {
-    "excludedCommands": ["virsh *", "virt-install *"]
+    "excludedCommands": ["virsh *", "virt-install *", "vm-ssh *"]
   },
   "env": {
     "LIBVIRT_DEFAULT_URI": "qemu:///session",
@@ -89,6 +92,7 @@ In `~/.claude/settings.json` (Claude's sandbox can't write this file; Robert edi
 - Why not `allowUnixSockets`: on Linux the sandbox blocks creating *any* unix socket (seccomp, at `socket()`, before
   a path is known), so a per-path allow has no effect. `allowAllUnixSockets` would open every socket `ted` has,
   including the systemd user manager.
+- `vm-ssh *`: see "ssh to the VMs". Not `ssh *`: that would run any ssh command line outside the sandbox.
 - `LIBVIRT_DEFAULT_URI`: `virsh` and `virt-install` use the session without `-c`.
 - `LIBVIRT_AUTOSTART=0`: when the user service isn't running, `virsh` fails instead of starting a libvirtd inside the
   sandbox.
@@ -118,9 +122,45 @@ virsh destroy claude-check
 virsh undefine claude-check
 ```
 
+## ssh to the VMs
+
+Claude's sandbox has its own network, so a plain `ssh` from Claude can't reach `virbr-pgv`. And `ssh` itself can't go
+on the `excludedCommands` list: outside the sandbox it reaches any host, and options such as
+`-o ProxyCommand=<command>`, `LocalCommand` or `-F <config>` run any command on the host.
+
+So Claude uses `vm-ssh`, which runs outside the sandbox but only does this:
+
+```bash
+vm-ssh <user>@<vm> [command ...]    # <vm>: hostname in pgv.internal, or 192.168.130.2-254
+```
+
+- It accepts no ssh options. It always runs ssh with `-F /dev/null` (no ssh config), its own key
+  `~/.ssh/pgv_ed25519`, no agent, no forwarding, `BatchMode`.
+- It refuses any address outside `192.168.130.2`-`254`. Hostnames are looked up at the network's DNS
+  (`192.168.130.1`), because the host's own resolver doesn't know `pgv.internal`.
+- It puts `--` before the destination: ssh also parses options *after* the destination, so without it a "command"
+  like `-oProxyCommand=...` would become an option.
+- It keeps no host keys: VMs are recreated often, and the network is only reachable from this host.
+- It is root-owned in `/usr/local/bin`. Claude can change `bin/vm-ssh` in this repo, so review a change to it before
+  running `install-root.sh` again. `check.sh` checks that both are the same.
+
+A VM that `vm-ssh` can reach, from a cloud image in `~/images` (tested with Rocky 9 GenericCloud):
+
+```bash
+virsh pool-refresh images
+virsh vol-create-as vms node1.qcow2 20G --format qcow2 \
+  --backing-vol /home/ted/images/<image> --backing-vol-format qcow2
+virt-install --name node1 --memory 2048 --vcpus 2 --virt-type kvm --import \
+  --disk vol=vms/node1.qcow2 --network bridge=virbr-pgv --graphics none --video vga --noautoconsole \
+  --osinfo <os> --cloud-init ssh-key=/home/ted/.ssh/pgv_ed25519.pub
+vm-ssh <default user of the image>@node1 uname -a
+```
+
+`--video vga` is needed: without a video card, the Rocky 9 kernel resets the VM straight after GRUB, before it
+prints anything. For your own users (e.g. `sa-ted` with sudo), pass `--cloud-init user-data=<file>` instead of `ssh-key=`.
+
 ## Not (yet) covered
 
-- **ssh from Claude to the VMs**: the sandbox's network can't reach `virbr-pgv`.
 - **Downloading cloud images** from Claude: the image sites aren't on the sandbox's allowed domains.
 - **Seeing the VMs in virt-manager as another user**: they are `ted`'s VMs. virt-manager can connect to
   `qemu+ssh://ted@localhost/session`, if `ted` accepts ssh logins.
@@ -131,7 +171,9 @@ virsh undefine claude-check
 # as ted
 systemctl --user disable --now libvirtd-session.service
 rm ~/.config/systemd/user/libvirtd-session.service
+rm ~/.ssh/pgv_ed25519 ~/.ssh/pgv_ed25519.pub
 # as root
+rm /usr/local/bin/vm-ssh
 sed -i '/^allow virbr-pgv$/d' /etc/qemu/bridge.conf
 dpkg-statoverride --remove /usr/lib/qemu/qemu-bridge-helper
 chown root:root /usr/lib/qemu/qemu-bridge-helper && chmod 0755 /usr/lib/qemu/qemu-bridge-helper

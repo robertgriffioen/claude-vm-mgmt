@@ -1,0 +1,69 @@
+#!/bin/bash
+# vm-ssh: ssh directly to a VM on the pgvillage network.
+#
+#   vm-ssh <user>@<vm> [command ...]
+#
+# Restricts direct SSH connections through this wrapper to the
+# pgvillage subnet. Not a general network isolation boundary.
+
+set -euo pipefail
+export PATH=/usr/bin:/bin
+
+NET_PREFIX=192.168.130
+DNS=${NET_PREFIX}.1
+DOMAIN=pgv.internal
+
+KEY=$(getent passwd "$(id -un)" | cut -d: -f6)/.ssh/pgv_ed25519
+
+die() {
+  echo "vm-ssh: $1" >&2
+  exit 2
+}
+
+[ $# -ge 1 ] || die "usage: vm-ssh <user>@<vm> [command ...]"
+[ -r "${KEY}" ] || die "SSH key not readable: ${KEY}"
+
+dest=$1
+shift
+
+[[ ${dest} =~ ^([a-z_][a-z0-9_-]{0,31})@([A-Za-z0-9.-]{1,253})$ ]] \
+  || die "expected <user>@<vm>, got '${dest}'"
+
+user=${BASH_REMATCH[1]}
+host=${BASH_REMATCH[2]%".${DOMAIN}"}
+
+# Resolve VM hostnames using the dedicated network DNS.
+if [[ ${host} =~ ^[a-z0-9][a-z0-9-]{0,62}$ ]]; then
+  ip=$(dig +short +time=2 +tries=1 @"${DNS}" "${host}.${DOMAIN}." A) \
+    || die "DNS lookup failed"
+  [ -n "${ip}" ] || die "${host}.${DOMAIN} doesn't resolve at ${DNS}"
+else
+  ip=${host}
+fi
+
+# Only allow VM addresses on the pgvillage network.
+[[ ${ip} =~ ^192\.168\.130\.(0|[1-9][0-9]{0,2})$ ]] \
+  || die "${ip} is not on ${NET_PREFIX}.0/24"
+
+octet=$((10#${BASH_REMATCH[1]}))
+((octet >= 2 && octet <= 254)) \
+  || die "${ip} is not a VM address"
+
+# "--": ssh also parses options after the destination; without it a "command" like -oProxyCommand=... becomes an option.
+exec /usr/bin/ssh -F /dev/null -i "${KEY}" \
+  -o IdentitiesOnly=yes \
+  -o IdentityAgent=none \
+  -o BatchMode=yes \
+  -o ConnectTimeout=10 \
+  -o StrictHostKeyChecking=no \
+  -o UserKnownHostsFile=/dev/null \
+  -o GlobalKnownHostsFile=/dev/null \
+  -o LogLevel=ERROR \
+  -o PermitLocalCommand=no \
+  -o ControlMaster=no \
+  -o ControlPath=none \
+  -o ForwardAgent=no \
+  -o ForwardX11=no \
+  -o ClearAllForwardings=yes \
+  -o EscapeChar=none \
+  -- "${user}@${ip}" "$@"
